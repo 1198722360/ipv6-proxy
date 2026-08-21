@@ -40,11 +40,11 @@ type Config struct {
 	// MaxConns 同时在线连接上限，防止把文件描述符吃光。
 	MaxConns int
 
-	// AdminListen 管理面监听地址。留空 = 不启动管理面。
+	// AdminListen 管理面监听地址。默认 0.0.0.0:6081；设成 "off" 可关闭。
 	//
-	// 默认就是留空：管理面能改白名单，把它改成 "*" 等于把这台机器变成
-	// 公网开放代理。这个能力必须由部署者显式开启，不能因为升级了个版本
-	// 就凭空多出一个监听端口。
+	// 管理面能改白名单，把它改成 "*" 等于把这台机器变成公网开放代理，
+	// 所以它自带三道闸：口令必填（不设则随机生成并打印）、登录限速、
+	// 与代理口令强制分离。真要关掉就显式写 PROXY_ADMIN_LISTEN=off。
 	AdminListen string
 
 	// AdminPassword 管理面口令，**与 Password 相互独立**。
@@ -67,7 +67,7 @@ func LoadConfig() (*Config, error) {
 		IdleTimeout:  envDuration("PROXY_IDLE_TIMEOUT", 300*time.Second),
 		MaxConns:     envInt("PROXY_MAX_CONNS", 256),
 
-		AdminListen:   strings.TrimSpace(os.Getenv("PROXY_ADMIN_LISTEN")),
+		AdminListen:   adminListen(),
 		AdminPassword: os.Getenv("PROXY_ADMIN_PASSWORD"),
 		EnvFile:       envFilePath(),
 	}
@@ -115,4 +115,21 @@ func splitHosts(raw string) []string {
 		}
 	}
 	return out
+}
+
+// adminListen 解析管理面监听地址。
+//
+// 默认开启（0.0.0.0:6081）。"off" / "no" / "false" / "disabled" 都表示关闭——
+// 只认一种写法的话，写了 PROXY_ADMIN_LISTEN=false 的人会得到一个
+// "监听地址 false 解析失败" 的报错，而他的本意很明确。
+func adminListen() string {
+	raw := strings.TrimSpace(os.Getenv("PROXY_ADMIN_LISTEN"))
+	if raw == "" {
+		return "0.0.0.0:6081"
+	}
+	switch strings.ToLower(raw) {
+	case "off", "no", "false", "disabled", "none":
+		return ""
+	}
+	return raw
 }

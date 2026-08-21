@@ -5,7 +5,7 @@
 # 做完这些事：
 #   1. 探测（或采用你指定的）IPv6 前缀
 #   2. 加 local 路由并做成开机自启 —— 这是唯一无法省略的宿主配置
-#   3. 安装二进制到 /usr/local/bin/ipv6-proxy
+#   3. 下载（或使用同目录的）二进制并安装到 /usr/local/bin/ipv6-proxy
 #   4. 生成 /etc/ipv6-proxy.env（口令留空则自动生成强口令并回显）
 #   5. 装 systemd unit、启用开机自启、启动
 #   6. 自检：进程活着、端口在听、真的能从代理出去
@@ -16,8 +16,9 @@
 #   sudo ./deploy.sh --prefix 2604:2dc0:143:8200::/56
 #   sudo ./deploy.sh --password '强口令' --port 6080
 #   sudo ./deploy.sh --hosts '*'                       # 关掉域名白名单（不推荐）
-#   sudo ./deploy.sh --admin                           # 同时开启管理面（默认 6081）
-#   sudo ./deploy.sh --admin --admin-listen 127.0.0.1  # 管理面只听本地，走 SSH 隧道
+#   sudo ./deploy.sh --admin-listen 127.0.0.1          # 管理面只听本地，走 SSH 隧道
+#   sudo ./deploy.sh --no-admin                        # 不要管理面
+#   sudo ./deploy.sh --release v20260821               # 装指定版本（默认最新）
 #   sudo ./deploy.sh --check                           # 只体检，不改任何东西
 #   sudo ./deploy.sh --uninstall                       # 卸干净
 #
@@ -29,6 +30,10 @@ BIN_DST=/usr/local/bin/ipv6-proxy
 # 配置放在专属目录而不是单个文件。原因是管理面要能原子替换它：
 # rename(2) 需要**目录**的写权限，只给文件写权限做不到原子替换，
 # 而非原子的写法在进程被 kill 时会留下残缺配置，下次开机就起不来。
+# 二进制从这个仓库的 Release 下载。仓库是公开的，不需要任何凭据。
+REPO="1198722360/ipv6-proxy"
+RELEASE_TAG=""   # 空 = 用 latest
+
 CONF_DIR=/etc/ipv6-proxy
 ENV_FILE="$CONF_DIR/env"
 LEGACY_ENV_FILE=/etc/ipv6-proxy.env
@@ -52,7 +57,9 @@ PORT=6080
 HOSTS=""
 MAX_CONNS=""
 LISTEN_ADDR="0.0.0.0"
-ADMIN_ENABLED=0
+# 管理面默认开启，与二进制的默认值保持一致。
+# 两边不一致的话会出现"deploy.sh 说没开、服务却在听 6081"这种矛盾状态。
+ADMIN_ENABLED=1
 ADMIN_PORT=6081
 ADMIN_LISTEN="0.0.0.0"
 ADMIN_PASSWORD=""
@@ -76,6 +83,8 @@ while [ $# -gt 0 ]; do
         --listen)    LISTEN_ADDR="${2:?--listen 需要一个地址}"; shift 2 ;;
         --hosts)     HOSTS="${2:?--hosts 需要一个值}"; shift 2 ;;
         --max-conns) MAX_CONNS="${2:?--max-conns 需要一个值}"; shift 2 ;;
+        --release)   RELEASE_TAG="${2:?--release 需要一个 tag，如 v20260821}"; shift 2 ;;
+        --no-admin)  ADMIN_ENABLED=0; shift ;;
         --admin)     ADMIN_ENABLED=1; shift ;;
         --admin-port)     ADMIN_ENABLED=1; ADMIN_PORT="${2:?--admin-port 需要一个值}"; shift 2 ;;
         --admin-listen)   ADMIN_ENABLED=1; ADMIN_LISTEN="${2:?--admin-listen 需要一个地址}"; shift 2 ;;
@@ -170,14 +179,17 @@ fi
 
 # ─────────────────── 定位并校验二进制 ───────────────────
 head_ "二进制"
+# 架构在下载分支里也要用，所以无条件先算。
+ARCH_SUFFIX="$(uname -m)"
+case "$ARCH_SUFFIX" in
+    x86_64)  ARCH_SUFFIX=amd64 ;;
+    aarch64|arm64) ARCH_SUFFIX=arm64 ;;
+    *) die "不支持的架构：$ARCH_SUFFIX（只提供 amd64 / arm64）" ;;
+esac
+
 if [ -z "$BINARY" ]; then
-    # 按常见程度依次找，省得每次都要打 --binary。
+    # 先找本地的，省得每次都要联网。
     HERE="$(cd "$(dirname "$0")" && pwd)"
-    ARCH_SUFFIX="$(uname -m)"
-    case "$ARCH_SUFFIX" in
-        x86_64)  ARCH_SUFFIX=amd64 ;;
-        aarch64) ARCH_SUFFIX=arm64 ;;
-    esac
     for candidate in \
         "$HERE/ipv6-proxy-linux-$ARCH_SUFFIX" \
         "$HERE/dist/ipv6-proxy-linux-$ARCH_SUFFIX" \
@@ -188,16 +200,42 @@ if [ -z "$BINARY" ]; then
     done
 fi
 
+# 本地没有就从 GitHub Release 下载。这样服务器上只要有 deploy.sh 一个文件，
+# 不需要装 Go、不需要 clone 仓库、不需要先 scp 二进制上来。
+if [ -z "$BINARY" ] && [ "$CHECK_ONLY" != 1 ]; then
+    ASSET="ipv6-proxy-linux-${ARCH_SUFFIX}"
+    URL="https://github.com/$REPO/releases/${RELEASE_TAG:-latest/download}/$ASSET"
+    [ -n "${RELEASE_TAG:-}" ] && URL="https://github.com/$REPO/releases/download/$RELEASE_TAG/$ASSET"
+
+    command -v curl >/dev/null 2>&1 || die "找不到二进制，也没有 curl 可供下载。
+    装一个：apt install curl
+    或手工把二进制传上来后指定：sudo $0 --binary /path/to/$ASSET"
+
+    log "本地没有二进制，从 GitHub 下载 $ASSET ..."
+    DOWNLOADED="/tmp/$ASSET.$$"
+    # -f 让 HTTP 错误（404 等）返回非零，否则会把一个 HTML 错误页当成二进制存下来，
+    # 直到执行时才报"格式错误"，那时已经很难联想到是下载失败。
+    if curl -fsSL --connect-timeout 15 --max-time 300 "$URL" -o "$DOWNLOADED"; then
+        BINARY="$DOWNLOADED"
+        # shellcheck disable=SC2064
+        trap "rm -f '$DOWNLOADED'" EXIT
+        ok "已下载（$(du -h "$DOWNLOADED" | cut -f1 | tr -d ' ')）"
+    else
+        rm -f "$DOWNLOADED"
+        die "下载失败：$URL
+    检查网络，或手工下载后指定：
+      curl -fLO $URL
+      sudo $0 --binary ./$ASSET"
+    fi
+fi
+
 if [ -z "$BINARY" ] || [ ! -f "$BINARY" ]; then
     # 体检模式下没有二进制不是致命错误——上面会如实报告"未安装"。
     if [ "$CHECK_ONLY" = 1 ]; then
         BINARY=""
         warn "找不到二进制，部分检查将跳过"
     else
-        die "找不到二进制${BINARY:+：$BINARY}。
-    先在开发机上编译：./build.sh ${ARCH_SUFFIX:-amd64}
-    再传上来：scp dist/ipv6-proxy-linux-${ARCH_SUFFIX:-amd64} deploy.sh root@本机:/tmp/
-    或显式指定：sudo $0 --binary /path/to/ipv6-proxy-linux-${ARCH_SUFFIX:-amd64}"
+        die "找不到二进制${BINARY:+：$BINARY}"
     fi
 else
     chmod +x "$BINARY" 2>/dev/null || true
@@ -418,6 +456,13 @@ PROXY_ADMIN_LISTEN=$ADMIN_LISTEN:$ADMIN_PORT
 PROXY_ADMIN_PASSWORD=$ADMIN_PASSWORD
 # 指向本文件自身：管理面靠它持久化在线修改。
 PROXY_ENV_FILE=$ENV_FILE
+EOF
+else
+    # 必须显式写 off，不能靠"不写这一行"。
+    # 二进制的默认值是开启，键缺失会被当成"用默认"，
+    # 于是 --no-admin 部署完 6081 照样在听——那正是这里踩过的坑。
+    cat >> "$ENV_FILE" <<EOF
+PROXY_ADMIN_LISTEN=off
 EOF
 fi
 umask 022

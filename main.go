@@ -80,12 +80,14 @@ func main() {
 
 	srv := NewServer(cfg, policy, resolver)
 
-	// 管理面是可选的，默认不开。它能改白名单，也就意味着能把这个
-	// 定向代理变成公网开放代理——这个能力必须显式开启。
+	// 管理面默认开启。它能改白名单，也就意味着能把这个定向代理变成
+	// 公网开放代理，所以下面三道闸一个都不能省：口令必填、与代理口令
+	// 强制分离、登录限速（在 admin.go 里）。
 	if cfg.AdminListen != "" {
 		if cfg.AdminPassword == "" {
 			cfg.AdminPassword = randomPassword()
 			log.Printf("未设置 PROXY_ADMIN_PASSWORD，本次随机生成: %s", cfg.AdminPassword)
+			log.Printf("注意：重启会重新生成。要固定请写进配置文件。")
 		}
 		if cfg.AdminPassword == cfg.Password {
 			// 共用口令时，在管理面改代理口令会把自己踢下线。
@@ -96,14 +98,23 @@ func main() {
 		}
 		admin := NewAdminServer(srv, cfg.AdminPassword, cfg.EnvFile)
 		if isPublicListen(cfg.AdminListen) {
-			log.Printf("警告：管理面监听在 %s（公网可达），且走明文 HTTP。", cfg.AdminListen)
-			log.Printf("      口令在链路上可被嗅探；建议用防火墙限定来源 IP。")
+			// 默认开启意味着升级一次就会凭空多出一个公网端口。
+			// 这件事必须在日志里说清楚，不能让人是被扫到了才发现。
+			log.Printf("警告：管理面监听在 %s（公网可达），走的是明文 HTTP。", cfg.AdminListen)
+			log.Printf("      口令可被链路上的中间人嗅探，且管理面能改白名单——")
+			log.Printf("      改成 * 等于把这台机器变成公网开放代理。")
+			log.Printf("      建议：防火墙限定来源 IP，或设 PROXY_ADMIN_LISTEN=127.0.0.1:6081 走 SSH 隧道。")
+			log.Printf("      不需要管理面就设 PROXY_ADMIN_LISTEN=off。")
 		}
 		go func() {
 			if err := admin.ListenAndServe(cfg.AdminListen); err != nil {
-				log.Printf("管理面退出: %v", err)
+				// 管理面起不来（端口被占等）不该让代理跟着死——
+				// 代理才是主业，管理面只是附属。
+				log.Printf("管理面退出: %v（代理服务不受影响）", err)
 			}
 		}()
+	} else {
+		log.Printf("管理面已关闭（PROXY_ADMIN_LISTEN=off）")
 	}
 
 	stop := make(chan os.Signal, 1)

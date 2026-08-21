@@ -1,6 +1,7 @@
 package main
 
 import (
+	"os"
 	"testing"
 	"time"
 )
@@ -94,5 +95,42 @@ func TestIsPublicListen(t *testing.T) {
 		if got := isPublicListen(tc.addr); got != tc.want {
 			t.Errorf("isPublicListen(%q) = %v, 期望 %v", tc.addr, got, tc.want)
 		}
+	}
+}
+
+// 管理面默认开启；关闭要显式写 off。
+// 多认几种写法是刻意的：写了 PROXY_ADMIN_LISTEN=false 的人意图很明确，
+// 只认 "off" 会让他得到一个"监听地址 false 解析失败"的无关报错。
+func TestAdminListenDefault(t *testing.T) {
+	for _, tc := range []struct {
+		raw, want string
+	}{
+		{"", "0.0.0.0:6081"},
+		{"off", ""},
+		{"OFF", ""},
+		{"no", ""},
+		{"false", ""},
+		{"disabled", ""},
+		{"none", ""},
+		{"127.0.0.1:6081", "127.0.0.1:6081"},
+		{"0.0.0.0:9999", "0.0.0.0:9999"},
+		{"  127.0.0.1:6081  ", "127.0.0.1:6081"},
+	} {
+		t.Setenv("PROXY_ADMIN_LISTEN", tc.raw)
+		if got := adminListen(); got != tc.want {
+			t.Errorf("adminListen(%q) = %q, 期望 %q", tc.raw, got, tc.want)
+		}
+	}
+}
+
+// 键缺失 = 用默认值 = 开启。
+//
+// 这条看着显然，但正是它导致过一个真实的 bug：deploy.sh 的 --no-admin
+// 当时只是"不写 PROXY_ADMIN_LISTEN 这一行"，于是二进制取默认值把 6081
+// 照样开起来了。关闭必须显式写 off，两边都得记住这件事。
+func TestAdminListen_MissingKeyMeansEnabled(t *testing.T) {
+	os.Unsetenv("PROXY_ADMIN_LISTEN")
+	if got := adminListen(); got == "" {
+		t.Error("键缺失时应返回默认监听地址（开启），而不是空串（关闭）")
 	}
 }
