@@ -9,3 +9,8 @@
 
 # 本地口令，绝不入库
 .env
+
+# release.sh 时代的残留：dist/ 下曾经放过 deploy.sh 和 .env.example 的副本。
+# 副本会和根目录的正本悄悄不同步——只留正本。
+/dist/deploy.sh
+/dist/.env.example
