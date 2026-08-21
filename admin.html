@@ -1,0 +1,277 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ipv6-proxy 管理</title>
+<style>
+  :root{
+    --bg:#f6f7f9; --card:#fff; --fg:#1a1d21; --muted:#6b7280;
+    --line:#e5e7eb; --accent:#2563eb; --ok:#16a34a; --warn:#d97706; --err:#dc2626;
+  }
+  @media (prefers-color-scheme:dark){
+    :root{ --bg:#15181c; --card:#1c2027; --fg:#e6e8ea; --muted:#9aa3ad;
+           --line:#2b313a; --accent:#60a5fa; --ok:#4ade80; --warn:#fbbf24; --err:#f87171; }
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--fg);
+       font:14px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif}
+  .wrap{max-width:960px;margin:0 auto;padding:20px 16px 60px}
+  h1{font-size:18px;margin:0 0 4px}
+  .sub{color:var(--muted);font-size:13px;margin-bottom:20px}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:10px;
+        padding:16px;margin-bottom:16px}
+  .card h2{font-size:14px;margin:0 0 12px;font-weight:600}
+  label{display:block;font-size:13px;color:var(--muted);margin:10px 0 4px}
+  input{width:100%;padding:8px 10px;border:1px solid var(--line);border-radius:6px;
+        background:var(--bg);color:var(--fg);font-size:14px;font-family:inherit}
+  input:focus{outline:2px solid var(--accent);outline-offset:-1px}
+  button{padding:8px 14px;border:0;border-radius:6px;background:var(--accent);
+         color:#fff;font-size:14px;cursor:pointer;font-family:inherit}
+  button:hover{opacity:.9}
+  button:disabled{opacity:.5;cursor:not-allowed}
+  button.ghost{background:transparent;color:var(--muted);border:1px solid var(--line)}
+  button.danger{background:var(--err)}
+  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:12px}
+  .stat{background:var(--bg);border-radius:8px;padding:10px 12px}
+  .stat .n{font-size:20px;font-weight:600;font-variant-numeric:tabular-nums}
+  .stat .l{font-size:12px;color:var(--muted)}
+  .rows{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:10px}
+  .tag{display:inline-flex;align-items:center;gap:6px;background:var(--bg);
+       border:1px solid var(--line);border-radius:999px;padding:4px 6px 4px 12px;font-size:13px}
+  .tag button{background:transparent;color:var(--muted);padding:0 4px;font-size:16px;line-height:1}
+  .tblwrap{overflow-x:auto}
+  table{width:100%;border-collapse:collapse;font-size:13px}
+  th,td{text-align:left;padding:6px 8px;border-bottom:1px solid var(--line);white-space:nowrap}
+  th{color:var(--muted);font-weight:500;font-size:12px}
+  td.mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px}
+  .ok{color:var(--ok)} .warnc{color:var(--warn)} .errc{color:var(--err)}
+  .msg{padding:10px 12px;border-radius:6px;margin-bottom:12px;font-size:13px;display:none}
+  .msg.show{display:block}
+  .msg.e{background:color-mix(in srgb,var(--err) 12%,transparent);color:var(--err)}
+  .msg.s{background:color-mix(in srgb,var(--ok) 12%,transparent);color:var(--ok)}
+  .note{font-size:12px;color:var(--muted);margin-top:6px}
+  .banner{background:color-mix(in srgb,var(--warn) 12%,transparent);color:var(--warn);
+          border:1px solid color-mix(in srgb,var(--warn) 30%,transparent);
+          border-radius:8px;padding:10px 12px;font-size:13px;margin-bottom:16px}
+  .hide{display:none}
+  .right{float:right;font-weight:400;color:var(--muted);font-size:12px}
+</style>
+
+<div class="wrap">
+  <!-- ── 登录 ── -->
+  <div id="loginView">
+    <h1>ipv6-proxy 管理</h1>
+    <div class="sub">请输入管理口令</div>
+    <div class="card" style="max-width:360px">
+      <div id="loginMsg" class="msg e"></div>
+      <label>管理口令</label>
+      <input id="pw" type="password" autocomplete="current-password">
+      <div style="margin-top:12px"><button id="loginBtn">登录</button></div>
+    </div>
+  </div>
+
+  <!-- ── 主界面 ── -->
+  <div id="mainView" class="hide">
+    <h1>ipv6-proxy <span class="right"><a href="#" id="logout" style="color:var(--muted)">退出</a></span></h1>
+    <div class="sub" id="meta">—</div>
+
+    <div class="card">
+      <h2>运行状态</h2>
+      <div class="grid" id="stats"></div>
+    </div>
+
+    <div class="card">
+      <h2>目标白名单</h2>
+      <div id="cfgMsg" class="msg"></div>
+      <div class="rows" id="hostTags"></div>
+      <div style="display:flex;gap:8px">
+        <input id="newHost" placeholder="例如 *.example.com" style="flex:1">
+        <button id="addHost" class="ghost">添加</button>
+      </div>
+      <div class="note" id="hostNote"></div>
+      <div style="margin-top:12px"><button id="saveHosts">保存白名单</button></div>
+    </div>
+
+    <div class="card">
+      <h2>代理口令</h2>
+      <div id="pwMsg" class="msg"></div>
+      <label>新口令（至少 8 位，不能含冒号）</label>
+      <input id="newPw" type="text" autocomplete="off">
+      <div class="note">改完之后<b>所有客户端都要更新凭据</b>；已建立的连接不受影响。管理口令是独立的，不会因此失效。</div>
+      <div style="margin-top:12px"><button id="savePw" class="danger">修改代理口令</button></div>
+    </div>
+
+    <div class="card">
+      <h2>最近连接 <span class="right" id="recentCount"></span></h2>
+      <div class="tblwrap">
+        <table>
+          <thead><tr><th>时间</th><th>协议</th><th>来源</th><th>目标</th><th>出口</th><th>结果</th></tr></thead>
+          <tbody id="recent"></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+const KEY = "ipv6_proxy_admin_key";
+let token = localStorage.getItem(KEY) || "";
+let hosts = [];
+let timer = null;
+
+const $ = id => document.getElementById(id);
+
+function show(el, text, kind){
+  el.textContent = text;
+  el.className = "msg show " + (kind || "e");
+  if (kind === "s") setTimeout(() => el.className = "msg", 4000);
+}
+
+// 所有请求走这里：401 一律清掉本地口令回到登录页，
+// 与 team-pool 前端 apiFetch 的行为保持一致。
+async function api(path, opts){
+  opts = opts || {};
+  opts.headers = Object.assign({"Content-Type":"application/json"}, opts.headers||{});
+  if (token) opts.headers["Authorization"] = "Bearer " + token;
+  const r = await fetch(path, opts);
+  if (r.status === 401){ logout(); throw new Error("登录已失效"); }
+  const body = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(body.error || ("HTTP " + r.status));
+  return body;
+}
+
+function logout(){
+  token = ""; localStorage.removeItem(KEY);
+  if (timer) { clearInterval(timer); timer = null; }
+  $("mainView").classList.add("hide");
+  $("loginView").classList.remove("hide");
+}
+
+async function login(){
+  const pw = $("pw").value;
+  if (!pw) return;
+  $("loginBtn").disabled = true;
+  try{
+    const r = await fetch("/api/login", {
+      method:"POST", headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({password: pw})
+    });
+    const body = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(body.error || ("HTTP " + r.status));
+    token = body.token;
+    localStorage.setItem(KEY, token);
+    $("pw").value = "";
+    enter();
+  }catch(e){ show($("loginMsg"), e.message); }
+  finally{ $("loginBtn").disabled = false; }
+}
+
+function enter(){
+  $("loginView").classList.add("hide");
+  $("mainView").classList.remove("hide");
+  refresh(); loadConfig();
+  if (!timer) timer = setInterval(refresh, 3000);
+}
+
+function fmtUptime(s){
+  const d = Math.floor(s/86400), h = Math.floor(s%86400/3600), m = Math.floor(s%3600/60);
+  if (d) return d + "天 " + h + "小时";
+  if (h) return h + "小时 " + m + "分";
+  return m + "分";
+}
+
+async function refresh(){
+  let s;
+  try{ s = await api("/api/status"); }catch(e){ return; }
+
+  $("meta").textContent = "版本 " + s.version + " · 已运行 " + fmtUptime(s.uptimeSec);
+  $("stats").innerHTML =
+    stat(s.active, "当前在途") + stat(s.accepted, "累计成功") +
+    stat(s.rejected, "超限拒绝") + stat(s.failed, "失败/拒绝");
+
+  $("recentCount").textContent = s.recent.length ? ("共 " + s.recent.length + " 条") : "";
+  $("recent").innerHTML = s.recent.length
+    ? s.recent.map(row).join("")
+    : '<tr><td colspan="6" style="color:var(--muted)">暂无记录</td></tr>';
+}
+
+const stat = (n, l) => '<div class="stat"><div class="n">' + n + '</div><div class="l">' + l + '</div></div>';
+
+function row(r){
+  const t = new Date(r.time);
+  const hh = String(t.getHours()).padStart(2,"0") + ":" +
+             String(t.getMinutes()).padStart(2,"0") + ":" +
+             String(t.getSeconds()).padStart(2,"0");
+  const cls = r.result === "ok" ? "ok" : (r.result === "rejected" ? "warnc" : "errc");
+  const label = r.result === "ok" ? "成功" : (r.result === "rejected" ? "超限" : "拒绝");
+  const detail = r.detail ? (" " + esc(r.detail)) : "";
+  return "<tr><td class=mono>" + hh + "</td><td>" + esc(r.protocol||"-") +
+         "</td><td class=mono>" + esc(r.client) + "</td><td class=mono>" + esc(r.target||"-") +
+         "</td><td class=mono>" + esc(r.source||"-") + "</td><td class=" + cls + ">" +
+         label + '<span style="color:var(--muted)">' + detail + "</span></td></tr>";
+}
+
+function esc(s){
+  return String(s == null ? "" : s).replace(/[&<>"]/g,
+    c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+}
+
+async function loadConfig(){
+  let c;
+  try{ c = await api("/api/config"); }catch(e){ return; }
+  hosts = c.allowedHosts || [];
+  renderHosts();
+  $("hostNote").textContent =
+    "出口前缀 " + c.prefix + " · 代理口令 " + c.passwordLength + " 位" +
+    (c.persistent ? " · 修改会写回配置文件，重启保持" : " · ⚠️ 未配置持久化，重启后回到原值");
+}
+
+function renderHosts(){
+  $("hostTags").innerHTML = hosts.length
+    ? hosts.map((h,i) =>
+        '<span class="tag">' + esc(h) + '<button data-i="' + i + '">×</button></span>').join("")
+    : '<span style="color:var(--muted)">（空）</span>';
+  $("hostTags").querySelectorAll("button").forEach(b => {
+    b.onclick = () => { hosts.splice(+b.dataset.i, 1); renderHosts(); };
+  });
+}
+
+$("addHost").onclick = () => {
+  const v = $("newHost").value.trim().toLowerCase();
+  if (!v) return;
+  if (hosts.includes(v)) { show($("cfgMsg"), "已经有这一条了"); return; }
+  hosts.push(v); $("newHost").value = ""; renderHosts();
+};
+$("newHost").onkeydown = e => { if (e.key === "Enter") $("addHost").click(); };
+
+$("saveHosts").onclick = async () => {
+  if (hosts.includes("*") &&
+      !confirm("白名单含 * 表示不限制目标。\n\n口令一旦泄漏，别人就能用你的服务器访问任意站点，溯源指向你。\n\n确定继续？")) return;
+  $("saveHosts").disabled = true;
+  try{
+    await api("/api/config", {method:"PUT", body: JSON.stringify({allowedHosts: hosts})});
+    show($("cfgMsg"), "已保存，下一个连接生效", "s");
+    loadConfig();
+  }catch(e){ show($("cfgMsg"), e.message); }
+  finally{ $("saveHosts").disabled = false; }
+};
+
+$("savePw").onclick = async () => {
+  const pw = $("newPw").value;
+  if (!pw) { show($("pwMsg"), "请输入新口令"); return; }
+  if (!confirm("修改代理口令后，所有客户端都要更新凭据。\n\n确定继续？")) return;
+  $("savePw").disabled = true;
+  try{
+    await api("/api/config", {method:"PUT", body: JSON.stringify({password: pw})});
+    $("newPw").value = "";
+    show($("pwMsg"), "代理口令已修改，记得更新所有客户端", "s");
+    loadConfig();
+  }catch(e){ show($("pwMsg"), e.message); }
+  finally{ $("savePw").disabled = false; }
+};
+
+$("loginBtn").onclick = login;
+$("pw").onkeydown = e => { if (e.key === "Enter") login(); };
+$("logout").onclick = e => { e.preventDefault(); logout(); };
+
+if (token) enter();
+</script>

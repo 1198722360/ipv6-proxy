@@ -1,0 +1,7 @@
+# 编译产物。build.sh 生成，按架构分文件。
+/dist/
+/ipv6-proxy
+*.exe
+
+# 本地口令，绝不入库
+.env
