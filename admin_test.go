@@ -395,6 +395,61 @@ func TestAdmin_GenerateReturnsUsableProxyStrings(t *testing.T) {
 		if !strings.Contains(socks, "example.net") {
 			t.Errorf("第 %d 条没用上指定的 host: %q", i, socks)
 		}
+
+		// 本机版：除了主机名换成 127.0.0.1，其余必须完全一致。
+		// 服务端拼好再下发，而不是让前端拿公网串做字符串替换——
+		// 口令里恰好含主机名或 @ 的话，替换会打在错误的位置上。
+		socksLocal := e["socks5Local"].(string)
+		httpLocal := e["httpLocal"].(string)
+		wantSocks := "socks5h://" + user + ":" + pass + "@127.0.0.1:"
+		if !strings.HasPrefix(socksLocal, wantSocks) {
+			t.Errorf("第 %d 条本机版 socks5 不对: %q", i, socksLocal)
+		}
+		if !strings.HasPrefix(httpLocal, "http://"+user+":"+pass+"@127.0.0.1:") {
+			t.Errorf("第 %d 条本机版 http 不对: %q", i, httpLocal)
+		}
+		// 端口必须和公网版一致：两个版本只该差主机名。
+		if p1, p2 := portOf(socks), portOf(socksLocal); p1 != p2 {
+			t.Errorf("第 %d 条公网版端口 %s 与本机版 %s 不一致", i, p1, p2)
+		}
+	}
+}
+
+// portOf 取代理串末尾的端口。
+func portOf(proxyURL string) string {
+	if idx := strings.LastIndex(proxyURL, ":"); idx >= 0 {
+		return proxyURL[idx+1:]
+	}
+	return ""
+}
+
+// 口令里含主机名时，前端若用字符串替换生成本机版会替换到口令上去。
+// 实测：host=1.2.3.4、口令 "my1.2.3.4pass"，朴素替换得到
+//
+//	socks5h://user:my127.0.0.1pass@1.2.3.4:6080
+//
+// ——口令被改了，主机名却没换。串看起来正常，用的时候才发现认证失败。
+// 服务端分别拼接就没有这个问题，这条测试钉住它。
+func TestAdmin_GenerateLocalWithTrickyPassword(t *testing.T) {
+	proxy, _ := startTestServer(t, []string{"example.com"})
+	// 口令里嵌着待会儿要传的 host，专门用来触发朴素替换的错误
+	cfg := *proxy.Config()
+	cfg.Password = "my1.2.3.4pass"
+	proxy.cfg.Store(&cfg)
+
+	admin := NewAdminServer(proxy, "adminpass123", "")
+	ts := httptest.NewServer(admin.Handler())
+	t.Cleanup(ts.Close)
+
+	_, body := do(t, ts, "POST", "/api/generate", "adminpass123",
+		map[string]any{"count": 1, "host": "1.2.3.4"})
+	e := body["entries"].([]any)[0].(map[string]any)
+	user := e["user"].(string)
+
+	wantLocal := "socks5h://" + user + ":my1.2.3.4pass@127.0.0.1:" +
+		portOf(e["socks5"].(string))
+	if got := e["socks5Local"].(string); got != wantLocal {
+		t.Errorf("含特殊字符的口令导致本机版拼错了\n得到: %s\n期望: %s", got, wantLocal)
 	}
 }
 

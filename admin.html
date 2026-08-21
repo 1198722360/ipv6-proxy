@@ -61,6 +61,8 @@
   .seg button{background:transparent;color:var(--muted);border-radius:0;padding:6px 14px}
   .seg button.on{background:var(--accent);color:#fff}
   input[type=number]{width:90px}
+  code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;
+       background:var(--bg);padding:1px 5px;border-radius:4px;border:1px solid var(--line)}
   .right{float:right;font-weight:400;color:var(--muted);font-size:12px}
 </style>
 
@@ -107,11 +109,31 @@
       <div class="note">出口地址是<b>随机</b>取的，不是 ::1 ::2 顺序排——顺序地址在上游看来高度规律，一个被标记时相邻的容易被连坐。</div>
       <div id="genOut" class="hide" style="margin-top:12px">
         <div class="row" style="margin-bottom:8px">
-          <button id="copyAll">复制全部</button>
-          <button id="dlBtn" class="ghost">下载 .txt</button>
           <span id="genCountLabel" style="color:var(--muted);font-size:13px"></span>
         </div>
-        <textarea id="genText" readonly spellcheck="false"></textarea>
+
+        <div style="margin-bottom:14px">
+          <div class="row" style="margin-bottom:6px">
+            <b style="font-size:13px">公网地址</b>
+            <span id="genHostLabel" style="color:var(--muted);font-size:12px"></span>
+            <button id="copyAll">复制全部</button>
+            <button id="dlBtn" class="ghost">下载 .txt</button>
+          </div>
+          <textarea id="genText" readonly spellcheck="false"></textarea>
+        </div>
+
+        <div>
+          <div class="row" style="margin-bottom:6px">
+            <b style="font-size:13px">本机 127.0.0.1</b>
+            <button id="copyAllLocal">复制全部</button>
+            <button id="dlBtnLocal" class="ghost">下载 .txt</button>
+          </div>
+          <div class="note" style="margin:0 0 6px">
+            给<b>服务器上直接跑的程序</b>用；本地机器要用的话先开隧道：
+            <code>ssh -L 6080:127.0.0.1:6080 root@服务器</code>
+          </div>
+          <textarea id="genTextLocal" readonly spellcheck="false"></textarea>
+        </div>
       </div>
     </div>
 
@@ -331,14 +353,16 @@ $("genBtn").onclick = async () => {
     const r = await api("/api/generate", {method:"POST", body: JSON.stringify({
       count: count, format: genFormat, host: $("genHost").value.trim()
     })});
-    const lines = [];
+    const lines = [], local = [];
     for (const e of r.entries){
-      if (genFormat === "socks5") lines.push(e.socks5);
-      else if (genFormat === "http") lines.push(e.http);
-      else lines.push(e.socks5, e.http);
+      if (genFormat === "socks5"){ lines.push(e.socks5); local.push(e.socks5Local); }
+      else if (genFormat === "http"){ lines.push(e.http); local.push(e.httpLocal); }
+      else { lines.push(e.socks5, e.http); local.push(e.socks5Local, e.httpLocal); }
     }
     $("genText").value = lines.join("\n");
-    $("genCountLabel").textContent = r.count + " 个出口地址 · 代理 " + r.host + ":" + r.port;
+    $("genTextLocal").value = local.join("\n");
+    $("genCountLabel").textContent = r.count + " 个出口地址 · 代理端口 " + r.port;
+    $("genHostLabel").textContent = r.host + ":" + r.port;
     $("genOut").classList.remove("hide");
     show($("genMsg"), "已生成 " + r.count + " 条", "s");
   }catch(e){ show($("genMsg"), e.message); }
@@ -370,15 +394,18 @@ async function copyText(text, btn, okLabel){
 }
 
 $("copyAll").onclick = () => copyText($("genText").value, $("copyAll"));
+$("copyAllLocal").onclick = () => copyText($("genTextLocal").value, $("copyAllLocal"));
 
-$("dlBtn").onclick = () => {
-  const blob = new Blob([$("genText").value], {type:"text/plain"});
+function download(text, suffix){
+  const blob = new Blob([text], {type:"text/plain"});
   const a = document.createElement("a");
   a.href = URL.createObjectURL(blob);
-  a.download = "ipv6-proxy-" + genFormat + "-" + Date.now() + ".txt";
+  a.download = "ipv6-proxy-" + genFormat + suffix + "-" + Date.now() + ".txt";
   a.click();
   URL.revokeObjectURL(a.href);
-};
+}
+$("dlBtn").onclick = () => download($("genText").value, "");
+$("dlBtnLocal").onclick = () => download($("genTextLocal").value, "-local");
 
 // ── 改管理口令 ──
 $("saveAdminPw").onclick = async () => {

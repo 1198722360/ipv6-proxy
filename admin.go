@@ -304,19 +304,30 @@ func (a *AdminServer) handleGenerate(w http.ResponseWriter, r *http.Request) {
 		User    string `json:"user"`
 		Socks5  string `json:"socks5"`
 		HTTP    string `json:"http"`
+		// 本机版：主机名固定 127.0.0.1，其余完全一致。
+		// 给服务器上直接跑的程序、或 ssh -L 隧道用。
+		Socks5Local string `json:"socks5Local"`
+		HTTPLocal   string `json:"httpLocal"`
 	}
 	out := make([]entry, 0, len(addrs))
+	portStr := strconv.Itoa(port)
+	hp := net.JoinHostPort(host, portStr)
+	// 本机串在服务端拼好，不让前端拿公网串去做字符串替换：
+	// 口令里要是恰好含主机名或 @，替换会打在错误的位置上，
+	// 而生成的串看起来还挺像那么回事，用的时候才发现连不上。
+	hpLocal := net.JoinHostPort("127.0.0.1", portStr)
 	for _, ip := range addrs {
 		user := DashForm(ip)
-		hp := net.JoinHostPort(host, strconv.Itoa(port))
 		out = append(out, entry{
 			Address: ip.String(),
 			User:    user,
 			// socks5h 而不是 socks5：h 表示域名交给代理去解析。
 			// 用 socks5 的话客户端会先本地解析再把 IP 发过来，
 			// 而服务端在白名单模式下拒绝 IP 字面量目标，整个请求会失败。
-			Socks5: fmt.Sprintf("socks5h://%s:%s@%s", user, cfg.Password, hp),
-			HTTP:   fmt.Sprintf("http://%s:%s@%s", user, cfg.Password, hp),
+			Socks5:      fmt.Sprintf("socks5h://%s:%s@%s", user, cfg.Password, hp),
+			HTTP:        fmt.Sprintf("http://%s:%s@%s", user, cfg.Password, hp),
+			Socks5Local: fmt.Sprintf("socks5h://%s:%s@%s", user, cfg.Password, hpLocal),
+			HTTPLocal:   fmt.Sprintf("http://%s:%s@%s", user, cfg.Password, hpLocal),
 		})
 	}
 
