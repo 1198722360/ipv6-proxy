@@ -341,3 +341,219 @@ func readAllString(r interface{ Read([]byte) (int, error) }) (string, error) {
 		}
 	}
 }
+
+// ── 批量生成 ──
+
+func TestAdmin_GenerateReturnsUsableProxyStrings(t *testing.T) {
+	_, proxy, ts := startAdmin(t, "")
+	pass := proxy.Config().Password
+
+	code, body := do(t, ts, "POST", "/api/generate", "adminpass123",
+		map[string]any{"count": 5, "host": "example.net"})
+	if code != http.StatusOK {
+		t.Fatalf("生成失败: %d %v", code, body["error"])
+	}
+	entries, ok := body["entries"].([]any)
+	if !ok || len(entries) != 5 {
+		t.Fatalf("条目数 = %v, 期望 5", body["entries"])
+	}
+
+	seen := make(map[string]bool)
+	for i, raw := range entries {
+		e := raw.(map[string]any)
+		addr := e["address"].(string)
+		user := e["user"].(string)
+		socks := e["socks5"].(string)
+
+		// 地址必须落在前缀内，否则服务端自己会拒绝——生成一堆不能用的串
+		// 比报错更糟，用户要试到第一个失败才发现。
+		ip := net.ParseIP(addr)
+		if ip == nil || !proxy.resolver.prefix.Contains(ip) {
+			t.Errorf("第 %d 条地址 %q 不在前缀内", i, addr)
+		}
+		// 用户名必须是破折号形态：带冒号会被 curl 按第一个冒号切碎。
+		if strings.Contains(user, ":") {
+			t.Errorf("第 %d 条用户名 %q 含冒号", i, user)
+		}
+		// 必须能被服务端自己的解析器接受——这是"生成的串真的能用"的硬证据。
+		if _, err := proxy.resolver.Resolve(user); err != nil {
+			t.Errorf("第 %d 条用户名 %q 服务端无法解析: %v", i, user, err)
+		}
+		if seen[addr] {
+			t.Errorf("地址重复: %s", addr)
+		}
+		seen[addr] = true
+
+		// socks5h 而非 socks5：h 表示域名交给代理解析。用 socks5 的话
+		// 客户端先本地解析再发 IP，而白名单模式下服务端拒绝 IP 字面量目标。
+		if !strings.HasPrefix(socks, "socks5h://") {
+			t.Errorf("第 %d 条应该用 socks5h://（域名交给代理解析），得到 %q", i, socks)
+		}
+		if !strings.Contains(socks, pass) {
+			t.Errorf("第 %d 条缺少口令", i)
+		}
+		if !strings.Contains(socks, "example.net") {
+			t.Errorf("第 %d 条没用上指定的 host: %q", i, socks)
+		}
+	}
+}
+
+// 代理端口和管理面端口不是一回事。生成串时用错端口，
+// 用户复制出去连的是管理面，得到一堆看不懂的 HTTP 报错。
+func TestAdmin_GenerateUsesProxyPortNotAdminPort(t *testing.T) {
+	_, proxy, ts := startAdmin(t, "")
+	// startTestServer 里 Listen 是 127.0.0.1:0，实际端口由内核分配
+	wantPort := proxyPortFrom(proxy.Config().Listen)
+
+	_, body := do(t, ts, "POST", "/api/generate", "adminpass123", map[string]any{"count": 1})
+	if got := int(body["port"].(float64)); got != wantPort {
+		t.Errorf("端口 = %d, 期望代理端口 %d", got, wantPort)
+	}
+}
+
+func TestAdmin_GenerateRejectsAbsurdCount(t *testing.T) {
+	_, _, ts := startAdmin(t, "")
+	if code, _ := do(t, ts, "POST", "/api/generate", "adminpass123",
+		map[string]any{"count": 100000}); code != http.StatusBadRequest {
+		t.Errorf("超大数量应被拒，得到 %d", code)
+	}
+}
+
+func TestAdmin_GenerateRequiresAuth(t *testing.T) {
+	_, _, ts := startAdmin(t, "")
+	if code, _ := do(t, ts, "POST", "/api/generate", "", map[string]any{"count": 1}); code != http.StatusUnauthorized {
+		t.Errorf("未授权应 401，得到 %d", code)
+	}
+}
+
+// ── 改管理口令 ──
+
+func TestAdmin_ChangeAdminPassword(t *testing.T) {
+	_, _, ts := startAdmin(t, "")
+
+	code, body := do(t, ts, "PUT", "/api/admin-password", "adminpass123",
+		map[string]any{"password": "brandnewadminpw123"})
+	if code != http.StatusOK {
+		t.Fatalf("改口令失败: %d %v", code, body["error"])
+	}
+	// 必须把新口令回给前端。不回的话前端本地还存着旧的，
+	// 下一个请求就 401——操作明明成功了却被登出。
+	if body["token"] != "brandnewadminpw123" {
+		t.Errorf("应回传新口令供前端替换，得到 %v", body["token"])
+	}
+
+	if code, _ := do(t, ts, "GET", "/api/status", "adminpass123", nil); code != http.StatusUnauthorized {
+		t.Errorf("旧口令应立即失效，得到 %d", code)
+	}
+	if code, _ := do(t, ts, "GET", "/api/status", "brandnewadminpw123", nil); code != http.StatusOK {
+		t.Errorf("新口令应可用，得到 %d", code)
+	}
+}
+
+// 两个口令相同会让服务下次启动时 log.Fatalf。放行的话这次还能跑，
+// 下次重启就起不来，而且现场完全看不出是几天前那次改口令埋的。
+func TestAdmin_RejectsPasswordCollision(t *testing.T) {
+	_, proxy, ts := startAdmin(t, "")
+	proxyPass := proxy.Config().Password
+
+	// 把管理口令改成与代理口令相同 -> 拒绝
+	if code, body := do(t, ts, "PUT", "/api/admin-password", "adminpass123",
+		map[string]any{"password": proxyPass}); code != http.StatusBadRequest {
+		t.Errorf("管理口令=代理口令 应被拒，得到 %d %v", code, body["error"])
+	}
+	// 反过来：把代理口令改成与管理口令相同 -> 也要拒绝
+	if code, body := do(t, ts, "PUT", "/api/config", "adminpass123",
+		map[string]any{"password": "adminpass123"}); code != http.StatusBadRequest {
+		t.Errorf("代理口令=管理口令 应被拒，得到 %d %v", code, body["error"])
+	}
+}
+
+func TestAdmin_AdminPasswordValidation(t *testing.T) {
+	_, _, ts := startAdmin(t, "")
+	for _, tc := range []struct{ name, pw string }{
+		{"太短", "short"},
+		{"刚好差一位", "elevenchars"},
+		{"空", ""},
+		{"含换行", "has\nnewline12345"},
+	} {
+		if code, _ := do(t, ts, "PUT", "/api/admin-password", "adminpass123",
+			map[string]any{"password": tc.pw}); code != http.StatusBadRequest {
+			t.Errorf("%s(%q): 应被拒，得到 %d", tc.name, tc.pw, code)
+		}
+	}
+}
+
+func TestAdmin_AdminPasswordPersists(t *testing.T) {
+	dir := t.TempDir()
+	envFile := filepath.Join(dir, "env")
+	if err := os.WriteFile(envFile,
+		[]byte("PROXY_ADMIN_PASSWORD=adminpass123\nPROXY_MAX_CONNS=99\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, _, ts := startAdmin(t, envFile)
+
+	if code, body := do(t, ts, "PUT", "/api/admin-password", "adminpass123",
+		map[string]any{"password": "persistedadminpw"}); code != http.StatusOK {
+		t.Fatalf("失败: %d %v", code, body["error"])
+	}
+	raw, _ := os.ReadFile(envFile)
+	got := string(raw)
+	if !strings.Contains(got, "PROXY_ADMIN_PASSWORD=persistedadminpw") {
+		t.Errorf("新口令没写进文件:\n%s", got)
+	}
+	if strings.Contains(got, "adminpass123") {
+		t.Errorf("旧口令还在:\n%s", got)
+	}
+	if !strings.Contains(got, "PROXY_MAX_CONNS=99") {
+		t.Errorf("未知键被吃掉了:\n%s", got)
+	}
+}
+
+// 改管理口令时一边有请求在读——atomic.Pointer 的正确性证明。
+func TestAdmin_PasswordChangeIsRaceFree(t *testing.T) {
+	_, _, ts := startAdmin(t, "")
+
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				// 口令一直在变，这里不断言状态码，只要不触发竞态检测即可
+				do2(ts, "GET", "/api/status", "somepassword")
+			}
+		}()
+	}
+	for i := 0; i < 10; i++ {
+		pw := fmt.Sprintf("rotatingadminpw%02d", i)
+		prev := "adminpass123"
+		if i > 0 {
+			prev = fmt.Sprintf("rotatingadminpw%02d", i-1)
+		}
+		if code, _ := do(t, ts, "PUT", "/api/admin-password", prev,
+			map[string]any{"password": pw}); code != http.StatusOK {
+			t.Errorf("第 %d 次改口令失败: %d", i, code)
+		}
+	}
+	close(stop)
+	wg.Wait()
+}
+
+// do2 不带 *testing.T，供并发 goroutine 使用（t 的方法不是并发安全的）。
+func do2(ts *httptest.Server, method, path, token string) {
+	req, err := http.NewRequest(method, ts.URL+path, nil)
+	if err != nil {
+		return
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	resp, err := ts.Client().Do(req)
+	if err == nil {
+		_ = resp.Body.Close()
+	}
+}

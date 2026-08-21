@@ -151,3 +151,87 @@ func TestDashForm_NoColon(t *testing.T) {
 		t.Errorf("往返不一致: %s -> %q -> %s", r.ProbeAddress(), got, back)
 	}
 }
+
+// 批量生成的地址必须全部落在前缀内、互不重复、且能被 Resolve 接受。
+// 生成一堆服务端自己会拒绝的串，比直接报错更糟——用户要试到
+// 第一个失败才发现，而那时他已经把整批配进客户端了。
+func TestRandomAddresses_AllValidAndUnique(t *testing.T) {
+	for _, cidr := range []string{
+		"2604:2dc0:143:8200::/56",
+		"2a01:4f8:c17:b8f::/64",
+		"2001:db8::/32",
+	} {
+		r, err := NewPrefixResolver(cidr)
+		if err != nil {
+			t.Fatalf("%s: %v", cidr, err)
+		}
+		addrs, err := r.RandomAddresses(50)
+		if err != nil {
+			t.Fatalf("%s: 生成失败: %v", cidr, err)
+		}
+		if len(addrs) != 50 {
+			t.Errorf("%s: 数量 = %d, 期望 50", cidr, len(addrs))
+		}
+		seen := make(map[string]bool)
+		for _, ip := range addrs {
+			if !r.prefix.Contains(ip) {
+				t.Errorf("%s: %s 不在前缀内", cidr, ip)
+			}
+			if _, err := r.Resolve(DashForm(ip)); err != nil {
+				t.Errorf("%s: %s 无法通过 Resolve: %v", cidr, ip, err)
+			}
+			if seen[ip.String()] {
+				t.Errorf("%s: 地址重复 %s", cidr, ip)
+			}
+			seen[ip.String()] = true
+		}
+	}
+}
+
+// 随机而不是顺序。顺序地址（::1 ::2 ::3）在上游看来高度规律，
+// 一个被标记时相邻的容易被连坐。
+func TestRandomAddresses_NotSequential(t *testing.T) {
+	r, err := NewPrefixResolver("2604:2dc0:143:8200::/56")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addrs, err := r.RandomAddresses(20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 顺序生成的话，相邻两个的最后一字节会差 1。随机生成时
+	// 20 个里连续出现这种情况的概率极低。
+	sequential := 0
+	for i := 1; i < len(addrs); i++ {
+		if addrs[i][15] == addrs[i-1][15]+1 {
+			sequential++
+		}
+	}
+	if sequential > 3 {
+		t.Errorf("看起来是顺序生成的（%d/%d 对相邻地址差 1）", sequential, len(addrs)-1)
+	}
+}
+
+// 窄前缀装不下请求的数量时要明确报错，而不是进循环里反复撞重复。
+func TestRandomAddresses_RejectsImpossibleRequests(t *testing.T) {
+	r, err := NewPrefixResolver("2a01:4f8:c17:b8f::1/128")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.RandomAddresses(10); err == nil {
+		t.Error("/128 只有一个地址，要 10 个应该报错")
+	}
+
+	// /126 有 4 个地址，要 100 个装不下
+	r2, err := NewPrefixResolver("2a01:4f8:c17:b8f::/126")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r2.RandomAddresses(100); err == nil {
+		t.Error("/126 只有 4 个地址，要 100 个应该报错")
+	}
+
+	if _, err := r.RandomAddresses(0); err == nil {
+		t.Error("要 0 个应该报错")
+	}
+}

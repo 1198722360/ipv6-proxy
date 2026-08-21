@@ -53,6 +53,14 @@
           border:1px solid color-mix(in srgb,var(--warn) 30%,transparent);
           border-radius:8px;padding:10px 12px;font-size:13px;margin-bottom:16px}
   .hide{display:none}
+  textarea{width:100%;min-height:180px;padding:10px;border:1px solid var(--line);
+           border-radius:6px;background:var(--bg);color:var(--fg);
+           font:12px/1.7 ui-monospace,SFMono-Regular,Menlo,monospace;resize:vertical}
+  .row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+  .seg{display:inline-flex;border:1px solid var(--line);border-radius:6px;overflow:hidden}
+  .seg button{background:transparent;color:var(--muted);border-radius:0;padding:6px 14px}
+  .seg button.on{background:var(--accent);color:#fff}
+  input[type=number]{width:90px}
   .right{float:right;font-weight:400;color:var(--muted);font-size:12px}
 </style>
 
@@ -80,6 +88,34 @@
     </div>
 
     <div class="card">
+      <h2>批量生成代理串</h2>
+      <div id="genMsg" class="msg"></div>
+      <div class="row">
+        <label style="margin:0">数量</label>
+        <input id="genCount" type="number" value="20" min="1" max="1000">
+        <div class="seg" id="genFmt">
+          <button data-f="socks5" class="on">SOCKS5</button>
+          <button data-f="http">HTTP</button>
+          <button data-f="both">两种都要</button>
+        </div>
+        <button id="genBtn">生成</button>
+      </div>
+      <div class="row" style="margin-top:8px">
+        <label style="margin:0">代理地址</label>
+        <input id="genHost" placeholder="留空则用当前访问的地址" style="flex:1;min-width:200px">
+      </div>
+      <div class="note">出口地址是<b>随机</b>取的，不是 ::1 ::2 顺序排——顺序地址在上游看来高度规律，一个被标记时相邻的容易被连坐。</div>
+      <div id="genOut" class="hide" style="margin-top:12px">
+        <div class="row" style="margin-bottom:8px">
+          <button id="copyAll">复制全部</button>
+          <button id="dlBtn" class="ghost">下载 .txt</button>
+          <span id="genCountLabel" style="color:var(--muted);font-size:13px"></span>
+        </div>
+        <textarea id="genText" readonly spellcheck="false"></textarea>
+      </div>
+    </div>
+
+    <div class="card">
       <h2>目标白名单</h2>
       <div id="cfgMsg" class="msg"></div>
       <div class="rows" id="hostTags"></div>
@@ -98,6 +134,15 @@
       <input id="newPw" type="text" autocomplete="off">
       <div class="note">改完之后<b>所有客户端都要更新凭据</b>；已建立的连接不受影响。管理口令是独立的，不会因此失效。</div>
       <div style="margin-top:12px"><button id="savePw" class="danger">修改代理口令</button></div>
+    </div>
+
+    <div class="card">
+      <h2>管理口令</h2>
+      <div id="apwMsg" class="msg"></div>
+      <label>新的管理口令（至少 12 位）</label>
+      <input id="newAdminPw" type="text" autocomplete="off">
+      <div class="note">这是登录本页面用的口令，与代理口令是两回事。改完本页会自动换用新口令，不会把你登出。<b>不能与代理口令相同</b>——那样服务下次重启会拒绝启动。</div>
+      <div style="margin-top:12px"><button id="saveAdminPw" class="danger">修改管理口令</button></div>
     </div>
 
     <div class="card">
@@ -267,6 +312,91 @@ $("savePw").onclick = async () => {
     loadConfig();
   }catch(e){ show($("pwMsg"), e.message); }
   finally{ $("savePw").disabled = false; }
+};
+
+// ── 批量生成 ──
+let genFormat = "socks5";
+document.querySelectorAll("#genFmt button").forEach(b => {
+  b.onclick = () => {
+    document.querySelectorAll("#genFmt button").forEach(x => x.classList.remove("on"));
+    b.classList.add("on");
+    genFormat = b.dataset.f;
+  };
+});
+
+$("genBtn").onclick = async () => {
+  const count = parseInt($("genCount").value, 10) || 20;
+  $("genBtn").disabled = true;
+  try{
+    const r = await api("/api/generate", {method:"POST", body: JSON.stringify({
+      count: count, format: genFormat, host: $("genHost").value.trim()
+    })});
+    const lines = [];
+    for (const e of r.entries){
+      if (genFormat === "socks5") lines.push(e.socks5);
+      else if (genFormat === "http") lines.push(e.http);
+      else lines.push(e.socks5, e.http);
+    }
+    $("genText").value = lines.join("\n");
+    $("genCountLabel").textContent = r.count + " 个出口地址 · 代理 " + r.host + ":" + r.port;
+    $("genOut").classList.remove("hide");
+    show($("genMsg"), "已生成 " + r.count + " 条", "s");
+  }catch(e){ show($("genMsg"), e.message); }
+  finally{ $("genBtn").disabled = false; }
+};
+
+// 复制。navigator.clipboard 在非 HTTPS 页面上不可用（浏览器限制），
+// 而这个管理面正是明文 HTTP——所以必须留 execCommand 这条退路，
+// 否则"复制全部"在绝大多数部署里都是个死按钮。
+async function copyText(text, btn, okLabel){
+  const original = btn.textContent;
+  let done = false;
+  try{
+    if (navigator.clipboard && window.isSecureContext){
+      await navigator.clipboard.writeText(text);
+      done = true;
+    }
+  }catch(e){ /* 落到下面的退路 */ }
+  if (!done){
+    const ta = document.createElement("textarea");
+    ta.value = text;
+    ta.style.position = "fixed"; ta.style.opacity = "0";
+    document.body.appendChild(ta); ta.select();
+    try{ done = document.execCommand("copy"); }catch(e){ done = false; }
+    document.body.removeChild(ta);
+  }
+  btn.textContent = done ? (okLabel || "已复制") : "复制失败，请手动选中";
+  setTimeout(() => btn.textContent = original, 2000);
+}
+
+$("copyAll").onclick = () => copyText($("genText").value, $("copyAll"));
+
+$("dlBtn").onclick = () => {
+  const blob = new Blob([$("genText").value], {type:"text/plain"});
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = "ipv6-proxy-" + genFormat + "-" + Date.now() + ".txt";
+  a.click();
+  URL.revokeObjectURL(a.href);
+};
+
+// ── 改管理口令 ──
+$("saveAdminPw").onclick = async () => {
+  const pw = $("newAdminPw").value;
+  if (!pw) { show($("apwMsg"), "请输入新口令"); return; }
+  if (pw.length < 12) { show($("apwMsg"), "管理口令至少 12 位"); return; }
+  if (!confirm("修改管理口令后，旧口令立即失效。\n\n本页会自动换用新口令，但其他设备上已登录的页面会被登出。\n\n确定继续？")) return;
+  $("saveAdminPw").disabled = true;
+  try{
+    const r = await api("/api/admin-password", {method:"PUT", body: JSON.stringify({password: pw})});
+    // 关键：立刻把本地存的 token 换成新口令。不然下一个请求就 401，
+    // 用户会看到"改成功了但马上被登出"，以为操作失败了。
+    token = r.token;
+    try{ localStorage.setItem(KEY, token); }catch(e){}
+    $("newAdminPw").value = "";
+    show($("apwMsg"), "管理口令已修改，本页已自动换用新口令", "s");
+  }catch(e){ show($("apwMsg"), e.message); }
+  finally{ $("saveAdminPw").disabled = false; }
 };
 
 $("loginBtn").onclick = login;

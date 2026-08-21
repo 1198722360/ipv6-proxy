@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crypto/rand"
 	"encoding/binary"
 	"fmt"
 	"net"
@@ -181,4 +182,68 @@ func (p *PrefixResolver) ProbeAddress() net.IP {
 // 第一个冒号拆 user:pass，带冒号的用户名会在发出前就被客户端切碎。
 func DashForm(ip net.IP) string {
 	return strings.ReplaceAll(ip.String(), ":", "-")
+}
+
+// RandomAddresses 在前缀内随机取 n 个地址，供批量生成代理串用。
+//
+// 随机而不是顺序（::1, ::2, ...）是有意的：顺序地址会让整段流量
+// 在上游看来高度规律，而且一旦其中一个被标记，相邻的很容易被连坐。
+// /56 里有 7.2e16 个地址，随机取几百个碰撞概率可以忽略。
+func (p *PrefixResolver) RandomAddresses(n int) ([]net.IP, error) {
+	if n <= 0 {
+		return nil, fmt.Errorf("数量必须大于 0")
+	}
+	ones, bits := p.prefix.Mask.Size()
+	hostBits := bits - ones
+	if hostBits == 0 {
+		// /128 里只有一个地址，要几个都只能给这一个。
+		return nil, fmt.Errorf("前缀 %s 只包含一个地址，无法批量生成", p.prefix)
+	}
+
+	// 可用地址数远小于请求数时直接说清楚，而不是进循环里反复撞重复。
+	if hostBits < 32 {
+		if capacity := uint64(1) << uint(hostBits); uint64(n) > capacity/2 {
+			return nil, fmt.Errorf("前缀 %s 只有 %d 个地址，一次最多生成 %d 个",
+				p.prefix, capacity, capacity/2)
+		}
+	}
+
+	base := p.prefix.IP.To16()
+	seen := make(map[string]struct{}, n)
+	out := make([]net.IP, 0, n)
+
+	// 上限防死循环：极端情况下随机源退化也不至于把请求挂住。
+	for attempts := 0; len(out) < n && attempts < n*100; attempts++ {
+		ip := make(net.IP, net.IPv6len)
+		copy(ip, base)
+
+		// 只随机主机位，网络位保持不变——生成出前缀外的地址就等于
+		// 生成了一个服务端自己会拒绝的地址。
+		randomBits := make([]byte, net.IPv6len)
+		if _, err := rand.Read(randomBits); err != nil {
+			return nil, fmt.Errorf("生成随机数失败: %w", err)
+		}
+		for i := 0; i < net.IPv6len; i++ {
+			// mask[i] 为 0 的位是主机位，可以随机；为 1 的是网络位，保持。
+			hostMask := ^p.prefix.Mask[i]
+			ip[i] = (base[i] & p.prefix.Mask[i]) | (randomBits[i] & hostMask)
+		}
+
+		// 跳过全零主机位（网络地址本身）和特殊用途地址。
+		if ip.IsUnspecified() || ip.IsLoopback() || ip.IsMulticast() ||
+			ip.IsLinkLocalUnicast() || ip.Equal(base) {
+			continue
+		}
+		key := ip.String()
+		if _, dup := seen[key]; dup {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, ip)
+	}
+
+	if len(out) < n {
+		return nil, fmt.Errorf("只生成出 %d 个不重复地址（请求 %d 个），前缀可能太窄", len(out), n)
+	}
+	return out, nil
 }

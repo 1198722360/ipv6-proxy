@@ -8,8 +8,10 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -29,8 +31,11 @@ const (
 // 复用代理端口是不行的：那边靠首字节嗅探分流（0x05 走 SOCKS5，其余走
 // CONNECT 处理器），在上面挂 HTTP 面会让未认证的请求进入已认证的代理路径。
 type AdminServer struct {
-	proxy    *Server
-	password string
+	proxy *Server
+	// password 是管理口令，可在运行期修改，所以用原子指针而不是裸 string。
+	// string 是两字长，撕裂读会读到长度和数据不匹配的值——而这个字段
+	// 每个请求都要读（checkAuth），改的时候正好有请求在读是常态。
+	password atomic.Pointer[string]
 	envFile  string
 
 	limiter  *rateLimiter
@@ -38,13 +43,17 @@ type AdminServer struct {
 }
 
 func NewAdminServer(proxy *Server, password, envFile string) *AdminServer {
-	return &AdminServer{
-		proxy:    proxy,
-		password: password,
-		envFile:  envFile,
-		limiter:  newRateLimiter(),
+	a := &AdminServer{
+		proxy:   proxy,
+		envFile: envFile,
+		limiter: newRateLimiter(),
 	}
+	a.password.Store(&password)
+	return a
 }
+
+// Password 返回当前管理口令。
+func (a *AdminServer) Password() string { return *a.password.Load() }
 
 func (a *AdminServer) Handler() http.Handler {
 	mux := http.NewServeMux()
@@ -53,6 +62,8 @@ func (a *AdminServer) Handler() http.Handler {
 	mux.HandleFunc("GET /api/status", a.requireAuth(a.handleStatus))
 	mux.HandleFunc("GET /api/config", a.requireAuth(a.handleGetConfig))
 	mux.HandleFunc("PUT /api/config", a.requireAuth(a.handlePutConfig))
+	mux.HandleFunc("PUT /api/admin-password", a.requireAuth(a.handlePutAdminPassword))
+	mux.HandleFunc("POST /api/generate", a.requireAuth(a.handleGenerate))
 	return mux
 }
 
@@ -106,7 +117,7 @@ func (a *AdminServer) checkAuth(r *http.Request) bool {
 	}
 	token := strings.TrimSpace(header[len(prefix):])
 	// 定长比较：逐字节短路比较会通过响应时间泄漏口令前缀。
-	return subtle.ConstantTimeCompare([]byte(token), []byte(a.password)) == 1
+	return subtle.ConstantTimeCompare([]byte(token), []byte(a.Password())) == 1
 }
 
 func (a *AdminServer) handleIndex(w http.ResponseWriter, r *http.Request) {
@@ -142,7 +153,7 @@ func (a *AdminServer) handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if subtle.ConstantTimeCompare([]byte(req.Password), []byte(a.password)) != 1 {
+	if subtle.ConstantTimeCompare([]byte(req.Password), []byte(a.Password())) != 1 {
 		a.limiter.fail(ip)
 		log.Printf("管理面登录失败，来源 %s", ip)
 		writeJSONError(w, http.StatusUnauthorized, "口令错误")
@@ -152,7 +163,7 @@ func (a *AdminServer) handleLogin(w http.ResponseWriter, r *http.Request) {
 	a.limiter.reset(ip)
 	// 回显口令当令牌，与 team-pool 的 AuthController.login 同形态：
 	// 没有会话状态，前端把它存起来后续每个请求带上。
-	writeJSON(w, http.StatusOK, map[string]string{"token": a.password})
+	writeJSON(w, http.StatusOK, map[string]string{"token": a.Password()})
 }
 
 func (a *AdminServer) handleStatus(w http.ResponseWriter, r *http.Request) {
@@ -203,6 +214,13 @@ func (a *AdminServer) handlePutConfig(w http.ResponseWriter, r *http.Request) {
 			writeJSONError(w, http.StatusBadRequest, err.Error())
 			return
 		}
+		// 不能把代理口令改成和管理口令一样。启动时 main.go 会因为两者
+		// 相同而 log.Fatalf——也就是说这里放行的话，服务这次还能跑，
+		// 下次重启就起不来了，而且现场看不出是几天前那次改口令埋的。
+		if req.Password == a.Password() {
+			writeJSONError(w, http.StatusBadRequest, "代理口令不能与管理口令相同（否则服务下次重启会拒绝启动）")
+			return
+		}
 		next.Password = req.Password
 		updates["PROXY_PASSWORD"] = req.Password
 	}
@@ -237,6 +255,161 @@ func (a *AdminServer) handlePutConfig(w http.ResponseWriter, r *http.Request) {
 		"ok":         true,
 		"persistent": a.envFile != "",
 	})
+}
+
+// handleGenerate 批量生成代理串，供页面上一键复制。
+//
+// 出口地址是随机取的，不是 ::1 ::2 顺序排——顺序地址在上游看来高度规律，
+// 而且一个被标记时相邻的容易被连坐。
+func (a *AdminServer) handleGenerate(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Count  int    `json:"count"`
+		Format string `json:"format"` // socks5 / http / both
+		Host   string `json:"host"`   // 客户端要连的地址；空则用请求里的 Host
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&req); err != nil {
+		writeJSONError(w, http.StatusBadRequest, "请求格式错误")
+		return
+	}
+
+	if req.Count <= 0 {
+		req.Count = 10
+	}
+	// 上限防一次要几十万条把内存和页面都撑爆。
+	if req.Count > 1000 {
+		writeJSONError(w, http.StatusBadRequest, "一次最多生成 1000 条")
+		return
+	}
+
+	cfg := a.proxy.Config()
+
+	// 客户端要连的主机名。优先用调用方指定的；没指定就从浏览器访问
+	// 管理面用的那个 Host 推——那个地址一定是从外部能连到本机的，
+	// 比服务端自己 guess 一个可靠。
+	host := strings.TrimSpace(req.Host)
+	if host == "" {
+		host = hostFromRequest(r)
+	}
+	// 代理端口和管理面端口不是同一个，必须从代理的监听地址里取。
+	port := proxyPortFrom(cfg.Listen)
+
+	addrs, err := a.proxy.resolver.RandomAddresses(req.Count)
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	type entry struct {
+		Address string `json:"address"`
+		User    string `json:"user"`
+		Socks5  string `json:"socks5"`
+		HTTP    string `json:"http"`
+	}
+	out := make([]entry, 0, len(addrs))
+	for _, ip := range addrs {
+		user := DashForm(ip)
+		hp := net.JoinHostPort(host, strconv.Itoa(port))
+		out = append(out, entry{
+			Address: ip.String(),
+			User:    user,
+			// socks5h 而不是 socks5：h 表示域名交给代理去解析。
+			// 用 socks5 的话客户端会先本地解析再把 IP 发过来，
+			// 而服务端在白名单模式下拒绝 IP 字面量目标，整个请求会失败。
+			Socks5: fmt.Sprintf("socks5h://%s:%s@%s", user, cfg.Password, hp),
+			HTTP:   fmt.Sprintf("http://%s:%s@%s", user, cfg.Password, hp),
+		})
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"count":   len(out),
+		"host":    host,
+		"port":    port,
+		"entries": out,
+	})
+}
+
+// hostFromRequest 从请求的 Host 头里取主机名（去掉端口）。
+//
+// 用它是因为：浏览器能访问到管理面，说明这个地址从外部可达，
+// 拿它当代理地址比服务端自己猜（监听 0.0.0.0 时根本猜不出）可靠。
+func hostFromRequest(r *http.Request) string {
+	h := r.Host
+	if host, _, err := net.SplitHostPort(h); err == nil {
+		return host
+	}
+	return h
+}
+
+// proxyPortFrom 从监听地址里取端口。
+func proxyPortFrom(listen string) int {
+	if _, portStr, err := net.SplitHostPort(listen); err == nil {
+		if p, err := strconv.Atoi(portStr); err == nil {
+			return p
+		}
+	}
+	return 6080
+}
+
+// handlePutAdminPassword 改管理口令。
+//
+// 单独一个端点而不是并进 /api/config，因为它的语义不一样：
+// 改完当前这个 token 立刻失效，前端必须换用新口令重新存。
+// 混在配置接口里会让"改了白名单顺手把自己踢下线"变得很容易发生。
+func (a *AdminServer) handlePutAdminPassword(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Password string `json:"password"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&req); err != nil {
+		writeJSONError(w, http.StatusBadRequest, "请求格式错误")
+		return
+	}
+
+	if err := validateAdminPassword(req.Password); err != nil {
+		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	// 与代理口令相同会让服务下次重启失败（main.go 里是 log.Fatalf）。
+	if req.Password == a.proxy.Config().Password {
+		writeJSONError(w, http.StatusBadRequest, "管理口令不能与代理口令相同（否则服务下次重启会拒绝启动）")
+		return
+	}
+
+	// 先落盘再切内存：写盘失败时如果内存已经改了，页面显示成功、
+	// 重启却变回旧口令，用户会拿着新口令死活登不进去。
+	if a.envFile != "" {
+		if err := UpdateEnvFile(a.envFile, map[string]string{
+			"PROXY_ADMIN_PASSWORD": req.Password,
+		}); err != nil {
+			writeJSONError(w, http.StatusInternalServerError, "持久化失败: "+err.Error())
+			return
+		}
+	}
+	a.password.Store(&req.Password)
+
+	// 改完之后旧 token 立即失效。把新口令回给前端，让它替换本地存的那份，
+	// 否则用户下一个请求就被登出了——明明操作是成功的。
+	log.Printf("管理面口令已修改")
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":         true,
+		"token":      req.Password,
+		"persistent": a.envFile != "",
+	})
+}
+
+// validateAdminPassword 校验管理口令。
+//
+// 比代理口令严一档（12 位起）：管理面能改白名单，改成 * 就等于把这台
+// 机器变成公网开放代理，而它还挂在公网上走明文 HTTP。
+func validateAdminPassword(pw string) error {
+	if len(pw) < 12 {
+		return fmt.Errorf("管理口令至少 12 位（它能改白名单，比代理口令更值得保护）")
+	}
+	if strings.ContainsAny(pw, "\n\r") {
+		return fmt.Errorf("口令不能含换行")
+	}
+	// 冒号本身在 Bearer 里没问题，但配置文件是 KEY=VALUE 逐行格式，
+	// 换行会把文件结构破坏掉。冒号放行。
+	return nil
 }
 
 // normalizeHosts 清洗白名单。
