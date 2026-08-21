@@ -7,18 +7,22 @@
 
 ## 快速开始
 
-编译在开发机上做，服务器只跑一个静态二进制，不需要装 Go、不需要 Docker。
+编译好的二进制就在仓库的 `dist/` 里，服务器上不需要装 Go、不需要 Docker。
 
 ```bash
-# 1) 开发机：交叉编译（默认 linux/amd64；甲骨文 ARM 之类用 ./build.sh arm64）
-./build.sh
-
-# 2) 传到服务器
-scp dist/ipv6-proxy-linux-amd64 deploy.sh root@服务器:/tmp/
-
-# 3) 服务器：一键部署（探测前缀、配路由、装 systemd、自检，全自动）
-ssh root@服务器 'cd /tmp && ./deploy.sh'
+# 服务器上只要这两条（deploy.sh 会自动下载对应架构的二进制）
+curl -fsSL https://raw.githubusercontent.com/1198722360/ipv6-proxy/main/deploy.sh -o deploy.sh
+chmod +x deploy.sh && sudo ./deploy.sh
 ```
+
+或者 clone 下来跑：
+
+```bash
+git clone https://github.com/1198722360/ipv6-proxy.git
+cd ipv6-proxy && sudo ./deploy.sh
+```
+
+一条命令搞定：探测前缀、配路由、装 systemd、开管理面、自检，全自动。
 
 `deploy.sh` 跑完会打印口令和现成的 curl 命令。之后：
 
@@ -49,8 +53,9 @@ curl --socks5-hostname 服务器IP:6080 \
 | `--port <端口>` | 监听端口，默认 6080 |
 | `--listen <地址>` | 监听地址，默认 `0.0.0.0`；收敛暴露面用 `127.0.0.1` |
 | `--hosts <列表>` | 目标白名单。默认沿用已有的；没有则用 OpenAI 那组 |
-| `--admin` | 开启管理面（状态页 + 在线改配置），默认端口 6081 |
+| `--no-admin` | 不要管理面（默认是开启的） |
 | `--admin-port` / `--admin-listen` / `--admin-password` | 管理面的端口 / 监听地址 / 口令 |
+| `--ref <分支>` | 从指定分支/tag 下载二进制（默认 main） |
 | `--check` | 只体检不改动（不需要 root） |
 | `--uninstall` | 停服务、删 unit 和二进制（保留口令文件） |
 
@@ -82,11 +87,14 @@ curl --socks5-hostname 服务器IP:6080 \
 如果你的机器上 `ip -6 addr` 看不到全球单播地址，那是网络层面缺 IPv6，
 任何配置方式都救不了。
 
-## 管理面（可选，默认不开）
+## 管理面（默认开启）
+
+部署完就能用，地址和口令在 `deploy.sh` 的输出里。
 
 ```bash
-sudo ./deploy.sh --admin                          # 公网可达，端口 6081
-sudo ./deploy.sh --admin --admin-listen 127.0.0.1 # 只听本地，走 SSH 隧道
+sudo ./deploy.sh                          # 默认：管理面在 0.0.0.0:6081
+sudo ./deploy.sh --admin-listen 127.0.0.1 # 只听本地，走 SSH 隧道（更安全）
+sudo ./deploy.sh --no-admin               # 完全不要管理面
 ```
 
 浏览器打开 `http://服务器IP:6081`，用管理口令登录。两块内容：
@@ -200,16 +208,22 @@ curl 的 `--proxy-user` 和 RFC 7617 的 Basic 都规定用户名不含冒号、
 
 幂等：重复执行不会重置口令、不会重复写配置。
 
-## 交叉编译
+## 发布新版本
+
+二进制**跟源码一起提交**在 `dist/` 下，服务器上不需要装 Go，也不需要 Token。
 
 ```bash
-./build.sh              # linux/amd64
-./build.sh arm64        # 甲骨文 ARM、树莓派
-./build.sh amd64 arm64  # 两个都编
+./build.sh amd64 arm64        # 编译两个架构 + 生成 SHA256SUMS
+git add -A && git commit -m "..." && git push
 ```
 
-`CGO_ENABLED=0` 静态链接，产物约 3.9MB，不依赖目标机的 glibc 版本——
+服务器上重新跑一次 `sudo ./deploy.sh` 即可升级（会保留现有口令和白名单）。
+
+`CGO_ENABLED=0` 静态链接，产物约 6MB，不依赖目标机的 glibc——
 实测在 alpine（musl，无 glibc）里也能直接跑。
+
+> 提交二进制的代价：每次重新提交约给仓库增加 11MB，且 **git 历史删不掉**。
+> 提交频率高的话仓库会持续变大，届时可改用 GitHub Release 分发。
 
 ## 排错
 

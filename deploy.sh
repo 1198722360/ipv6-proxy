@@ -18,7 +18,7 @@
 #   sudo ./deploy.sh --hosts '*'                       # 关掉域名白名单（不推荐）
 #   sudo ./deploy.sh --admin-listen 127.0.0.1          # 管理面只听本地，走 SSH 隧道
 #   sudo ./deploy.sh --no-admin                        # 不要管理面
-#   sudo ./deploy.sh --release v20260821               # 装指定版本（默认最新）
+#   sudo ./deploy.sh --ref v1.0                        # 装指定分支/tag（默认 main）
 #   sudo ./deploy.sh --check                           # 只体检，不改任何东西
 #   sudo ./deploy.sh --uninstall                       # 卸干净
 #
@@ -30,9 +30,9 @@ BIN_DST=/usr/local/bin/ipv6-proxy
 # 配置放在专属目录而不是单个文件。原因是管理面要能原子替换它：
 # rename(2) 需要**目录**的写权限，只给文件写权限做不到原子替换，
 # 而非原子的写法在进程被 kill 时会留下残缺配置，下次开机就起不来。
-# 二进制从这个仓库的 Release 下载。仓库是公开的，不需要任何凭据。
+# 二进制跟源码一起提交在这个仓库的 dist/ 下。仓库是公开的，不需要凭据。
 REPO="1198722360/ipv6-proxy"
-RELEASE_TAG=""   # 空 = 用 latest
+REF="main"   # 分支名、tag 或 commit，用 --ref 指定
 
 CONF_DIR=/etc/ipv6-proxy
 ENV_FILE="$CONF_DIR/env"
@@ -83,7 +83,7 @@ while [ $# -gt 0 ]; do
         --listen)    LISTEN_ADDR="${2:?--listen 需要一个地址}"; shift 2 ;;
         --hosts)     HOSTS="${2:?--hosts 需要一个值}"; shift 2 ;;
         --max-conns) MAX_CONNS="${2:?--max-conns 需要一个值}"; shift 2 ;;
-        --release)   RELEASE_TAG="${2:?--release 需要一个 tag，如 v20260821}"; shift 2 ;;
+        --ref)       REF="${2:?--ref 需要一个分支名/tag/commit}"; shift 2 ;;
         --no-admin)  ADMIN_ENABLED=0; shift ;;
         --admin)     ADMIN_ENABLED=1; shift ;;
         --admin-port)     ADMIN_ENABLED=1; ADMIN_PORT="${2:?--admin-port 需要一个值}"; shift 2 ;;
@@ -200,12 +200,11 @@ if [ -z "$BINARY" ]; then
     done
 fi
 
-# 本地没有就从 GitHub Release 下载。这样服务器上只要有 deploy.sh 一个文件，
-# 不需要装 Go、不需要 clone 仓库、不需要先 scp 二进制上来。
+# 本地没有就从 GitHub 拉。仓库是公开的，二进制跟源码一起提交在 dist/ 下，
+# 所以不需要任何凭据，也不需要先 clone 整个仓库。
 if [ -z "$BINARY" ] && [ "$CHECK_ONLY" != 1 ]; then
     ASSET="ipv6-proxy-linux-${ARCH_SUFFIX}"
-    URL="https://github.com/$REPO/releases/${RELEASE_TAG:-latest/download}/$ASSET"
-    [ -n "${RELEASE_TAG:-}" ] && URL="https://github.com/$REPO/releases/download/$RELEASE_TAG/$ASSET"
+    URL="https://raw.githubusercontent.com/$REPO/${REF:-main}/dist/$ASSET"
 
     command -v curl >/dev/null 2>&1 || die "找不到二进制，也没有 curl 可供下载。
     装一个：apt install curl
@@ -213,8 +212,8 @@ if [ -z "$BINARY" ] && [ "$CHECK_ONLY" != 1 ]; then
 
     log "本地没有二进制，从 GitHub 下载 $ASSET ..."
     DOWNLOADED="/tmp/$ASSET.$$"
-    # -f 让 HTTP 错误（404 等）返回非零，否则会把一个 HTML 错误页当成二进制存下来，
-    # 直到执行时才报"格式错误"，那时已经很难联想到是下载失败。
+    # -f 让 HTTP 错误（404 等）返回非零。没有它，curl 会把一个 HTML 错误页
+    # 原样存成"二进制"，直到执行时才报格式错误——那时已经很难联想到是下载失败。
     if curl -fsSL --connect-timeout 15 --max-time 300 "$URL" -o "$DOWNLOADED"; then
         BINARY="$DOWNLOADED"
         # shellcheck disable=SC2064

@@ -49,12 +49,31 @@ for ARCH in "${ARCHS[@]}"; do
     echo "    $OUT  ($SIZE)"
 done
 
+# 校验和跟二进制一起提交，方便核对下载到的文件有没有被改过或传坏。
+( cd dist && if command -v sha256sum >/dev/null 2>&1; then
+      sha256sum ipv6-proxy-linux-* > SHA256SUMS
+  else
+      shasum -a 256 ipv6-proxy-linux-* > SHA256SUMS
+  fi )
+echo "    dist/SHA256SUMS"
+
 if [ -n "$COMMIT_TIME" ]; then
     echo
     echo "源码提交时间: $COMMIT_TIME"
 fi
 
+case "$VERSION" in
+    *-dirty)
+        echo
+        echo "注意：版本号带 -dirty，说明工作区有未提交的改动。"
+        echo "     提交之后重新跑一次 ./build.sh，版本号才对得上仓库里的 commit。"
+        ;;
+esac
+
 echo
-echo "下一步——把二进制和部署脚本一起传到服务器："
-echo "  scp dist/ipv6-proxy-linux-amd64 deploy.sh root@服务器:/tmp/"
-echo "  ssh root@服务器 'cd /tmp && ./deploy.sh --binary ./ipv6-proxy-linux-amd64'"
+echo "下一步——提交二进制并推送："
+echo "  git add -A && git commit -m '...' && git push"
+echo
+echo "服务器上安装（只需要 deploy.sh 一个文件，二进制会自动下载）："
+echo "  curl -fsSL https://raw.githubusercontent.com/1198722360/ipv6-proxy/main/deploy.sh -o deploy.sh"
+echo "  chmod +x deploy.sh && sudo ./deploy.sh"
