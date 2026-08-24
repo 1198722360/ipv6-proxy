@@ -355,3 +355,49 @@ func TestSocks5_ColonUsernameRejected(t *testing.T) {
 		t.Error("认证失败时不应发生拨号")
 	}
 }
+
+// 目标只有 A 记录时的报错必须带上域名。
+//
+// 这是本代理最常见的一类失败（ChatGPT 页面上的 featureassets.org、
+// events.statsigapi.net 等都只有 A 记录）。不带域名的话，日志和状态页里
+// 是一堆一模一样的"目标没有可用的 IPv6 地址"，排查时只能靠时间戳去猜是谁。
+//
+// 断言的是 stats 里的记录，也就是**运维在状态页上真正看到的那行字**，
+// 而不是某个内部函数的返回值——包装是在 handler 里做的，在更靠下的层
+// 断言会漏掉它。
+func TestDialFirst_NoIPv6TargetNamesTheDomain(t *testing.T) {
+	srv, _ := startTestServer(t, []string{"v4only.example"})
+	// 让这个域名只解析出 IPv4
+	srv.policy.Load().lookup = func(string) ([]net.IP, error) {
+		return []net.IP{net.ParseIP("93.184.216.34")}, nil
+	}
+	// 用真实的 BoundDialer：它才会走到"候选地址全是 v4"那条分支。
+	srv.dialer = &BoundDialer{Timeout: 2 * time.Second}
+
+	c := dialProxy(t, srv)
+	if rep := socks5Handshake(t, c, "2604-2dc0-143-8200--1", "testpass", "v4only.example", 443); rep == repSuccess {
+		t.Fatal("只有 A 记录的目标不该连成功")
+	}
+
+	// 连接处理在独立协程里，等它把失败记下来。
+	var detail string
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		snap := srv.stats.Snapshot(0)
+		if len(snap.Recent) > 0 && snap.Recent[0].Detail != "" {
+			detail = snap.Recent[0].Detail
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	if detail == "" {
+		t.Fatal("状态页里没有记录到这次失败")
+	}
+	if !strings.Contains(detail, "v4only.example") {
+		t.Errorf("状态页的报错必须带上域名，实际: %q", detail)
+	}
+	if !strings.Contains(detail, "AAAA") {
+		t.Errorf("报错应说明是缺 AAAA 记录，实际: %q", detail)
+	}
+}

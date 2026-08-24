@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"sync"
@@ -63,6 +64,13 @@ func (d *BoundDialer) DialFrom(ctx context.Context, source net.IP, target net.IP
 	return conn, nil
 }
 
+// ErrNoIPv6Target 表示目标域名没有 AAAA 记录。
+//
+// 这是本代理最常见的一类"失败"，而且往往不是故障：出口源地址是 IPv6，
+// 内核就只能连 IPv6 目标。像 featureassets.org、events.statsigapi.net
+// 这类只有 A 记录的域名，连不上是必然的。
+var ErrNoIPv6Target = errors.New("目标域名没有 AAAA 记录（本代理出口是 IPv6，只能连 IPv6 目标）")
+
 // DialFirst 依次尝试候选地址，返回第一个连成功的。
 //
 // 一个域名可能解析出多个 AAAA，只试第一个会在那台机器故障时整体失败。
@@ -79,7 +87,11 @@ func (d *BoundDialer) DialFirst(ctx context.Context, source net.IP, targets []ne
 		lastErr = err
 	}
 	if lastErr == nil {
-		lastErr = fmt.Errorf("目标没有可用的 IPv6 地址")
+		// 走到这里说明候选地址全被上面的 To4() 跳过了，也就是目标只有
+		// A 记录、没有 AAAA。用哨兵错误而不是纯文本，好让调用方能识别
+		// 出这一类失败并补上域名——DialFirst 只拿到解析后的 IP，不知道
+		// 用户请求的是哪个域名，而排查时最需要的恰恰是那个域名。
+		return nil, ErrNoIPv6Target
 	}
 	return nil, lastErr
 }

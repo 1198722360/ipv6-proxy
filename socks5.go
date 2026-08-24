@@ -132,6 +132,10 @@ func (s *Server) handleSocks5(conn net.Conn, first byte) error {
 	defer cancel()
 	upstream, err := s.dialer.DialFirst(ctx, source, targets, port)
 	if err != nil {
+		// 补上域名再往上报。DialFirst 只看得到 IP，而排查时第一个要问的
+		// 就是"哪个域名连不上"——不带域名的话日志里只有一堆一模一样的
+		// "目标没有可用的 IPv6 地址"，得靠时间戳去猜。
+		err = fmt.Errorf("%s:%d: %w", host, port, err)
 		writeSocksReply(conn, repHostUnreachable)
 		return err
 	}
